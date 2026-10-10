@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<title>Schlange OCR</title>
+<style>
+  :root { color-scheme: dark; --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#cbd5e1; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; min-height:100%; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  body { padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }
+  main { width:min(100%, 900px); margin:0 auto; display:flex; flex-direction:column; gap:12px; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  h1 { font-size:clamp(1.2rem, 3.8vw, 1.7rem); margin:0; }
+  .sub { color:var(--muted); font-size:.9rem; margin:3px 0 0; }
+  .panel { background:var(--panel); border:1px solid #374151; border-radius:16px; padding:12px; }
+  .camera-wrap { position:relative; overflow:hidden; border-radius:12px; background:#030712; min-height:180px; }
+  video { display:block; width:100%; height:min(48dvh, 440px); min-height:180px; object-fit:contain; background:#030712; }
+  .status { min-height:60px; display:flex; align-items:center; justify-content:center; text-align:center; border-radius:12px; font-size:clamp(1.4rem, 5vw, 2.2rem); font-weight:850; letter-spacing:.02em; }
+  .status.empty { background:#111827; color:#9ca3af; border:1px dashed #4b5563; font-size:1rem; font-weight:500; }
+  .status.blocked { background:#7f1d1d; color:#fff; border:2px solid #f87171; }
+  .status.posted { background:#14532d; color:#fff; border:2px solid #4ade80; }
+  .controls { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  button { border:0; border-radius:12px; min-height:50px; padding:12px 14px; font:700 1rem system-ui,sans-serif; cursor:pointer; touch-action:manipulation; }
+  button:disabled { opacity:.5; cursor:default; }
+  .primary { background:#2563eb; color:white; }
+  .secondary { background:#374151; color:white; border:1px solid #6b7280; }
+  .info { color:var(--muted); font-size:.9rem; line-height:1.4; overflow-wrap:anywhere; }
+  details summary { cursor:pointer; font-weight:700; padding:4px 0; }
+  pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow:auto; font-size:.85rem; color:#e5e7eb; }
+  .small { color:#9ca3af; font-size:.8rem; }
+  @media (orientation:landscape) and (max-height:600px) {
+    main { gap:8px; }
+    .panel { padding:8px; }
+    video { height: min(42dvh, 270px); min-height:130px; }
+    .status { min-height:48px; }
+    button { min-height:44px; }
+  }
+  @media (max-width:480px) {
+    .controls { grid-template-columns:1fr 1fr; }
+    .panel { padding:10px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Schlange-Erkennung</h1>
+      <p class="sub">Lokale Texterkennung · iPad Safari</p>
+    </div>
+    <span id="engineBadge" class="small">OCR nicht geladen</span>
+  </header>
+
+  <section class="panel">
+    <div class="camera-wrap"><video id="video" autoplay muted playsinline></video></div>
+  </section>
+
+  <section id="status" class="status empty" role="status" aria-live="polite"></section>
+
+  <section class="panel">
+    <div class="controls">
+      <button id="startBtn" class="primary">Kamera starten</button>
+      <button id="stopBtn" class="secondary" disabled>Stoppen</button>
+    </div>
+    <p id="info" class="info">Tippe auf „Kamera starten“ und erlaube den Kamerazugriff. Die Seite muss über HTTPS geöffnet werden.</p>
+    <p class="small">Bei lesbarem Text ohne Treffer erscheint „GEPOSTET“. Wenn kein Text erkannt wird, bleibt der Status leer.</p>
+  </section>
+
+  <details class="panel">
+    <summary>Erkannten Text anzeigen (Test)</summary>
+    <pre id="recognized">Noch keine Erkennung durchgeführt.</pre>
+  </details>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+(() => {
+  "use strict";
+  const video = document.getElementById("video");
+  const statusEl = document.getElementById("status");
+  const infoEl = document.getElementById("info");
+  const recognizedEl = document.getElementById("recognized");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const engineBadge = document.getElementById("engineBadge");
+
+  let stream = null;
+  let worker = null;
+  let running = false;
+  let scanning = false;
+  let scanTimer = null;
+  let lastStatus = "";
+  let statusTimeout = null;
+
+  function setInfo(message) { infoEl.textContent = message; }
+
+  function setStatus(kind, text) {
+    if (statusTimeout) {
+      clearTimeout(statusTimeout);
+      statusTimeout = null;
+    }
+    statusEl.className = "status " + (kind || "empty");
+    statusEl.textContent = (text === undefined || text === null) ? "" : text;
+    lastStatus = kind || "empty";
+
+    // Nach einer Entscheidung bleibt die Anzeige genau 3 Sekunden sichtbar.
+    // Danach wird sie geleert und erst dann ist ein neuer Scan per Start möglich.
+    if (kind === "blocked" || kind === "posted") {
+      const shownKind = kind;
+      startBtn.disabled = true;
+      startBtn.textContent = "Bitte warten …";
+      statusTimeout = setTimeout(() => {
+        if (lastStatus === shownKind) {
+          statusEl.className = "status empty";
+          statusEl.textContent = "";
+          lastStatus = "empty";
+        }
+        statusTimeout = null;
+        if (running) {
+          startBtn.disabled = false;
+          startBtn.textContent = "Nächsten Text scannen";
+          setInfo("Bereit für den nächsten Scan. Tippe auf „Nächsten Text scannen“.");
+        }
+      }, 3000);
+    }
+  }
+
+  function normalize(s) {
+    return (s || "")
+      .toLocaleLowerCase("de")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[0]/g, "o")
+      .replace(/[1|!]/g, "l")
+      .replace(/[5$]/g, "s")
+      .replace(/[^a-z]/g, "");
+  }
+
+  function editDistance(a, b) {
+    const d = Array.from({length:a.length + 1}, () => Array(b.length + 1).fill(0));
+    for (let i=0; i<=a.length; i++) d[i][0] = i;
+    for (let j=0; j<=b.length; j++) d[0][j] = j;
+    for (let i=1; i<=a.length; i++) {
+      for (let j=1; j<=b.length; j++) {
+        d[i][j] = Math.min(
+          d[i-1][j] + 1,
+          d[i][j-1] + 1,
+          d[i-1][j-1] + (a[i-1] === b[j-1] ? 0 : 1)
+        );
+        // Damerau-style adjacent transposition, e.g. "schalnge"
+        if (i > 1 && j > 1 && a[i-1] === b[j-2] && a[i-2] === b[j-1]) {
+          d[i][j] = Math.min(d[i][j], d[i-2][j-2] + 1);
+        }
+      }
+    }
+    return d[a.length][b.length];
+  }
+
+  function tokenMayMatch(token) {
+    const word = normalize(token);
+    if (!word) return false;
+
+    // Direkte Treffer: auch wenn "schlange" mitten in einem längeren Wort steht.
+    if (word.includes("schlange") || word.includes("schalnge")) return true;
+
+    // Häufige OCR-Verwechslungen und Buchstabendreher.
+    // Bewusst empfindlicher: bis zu zwei Zeichen Abweichung bei einem Wortteil.
+    const targets = ["schlange", "schalnge"];
+    for (const target of targets) {
+      for (let start = 0; start < word.length; start++) {
+        for (let len = 6; len <= 10; len++) {
+          const piece = word.slice(start, start + len);
+          if (piece.length >= 6 && editDistance(piece, target) <= 2) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function containsTarget(text) {
+    if (!text) return false;
+    // Preserve word boundaries first to avoid joining unrelated adjacent words.
+    const rawTokens = text.match(/[\p{L}\p{N}]+(?:[-‐‑–][\p{L}\p{N}]+)*/gu) || [];
+    for (const token of rawTokens) {
+      if (tokenMayMatch(token)) return true;
+      // Handle OCR hyphenation inside a single recognized token.
+      if (/[-‐‑–]/.test(token) && tokenMayMatch(token.replace(/[-‐‑–]/g, ""))) return true;
+    }
+    // OCR sometimes returns a compound split by a space. Join neighboring alphabetic
+    // tokens conservatively when one side looks like a fragment of "schlange".
+    const simple = text.split(/\s+/).map(normalize).filter(Boolean);
+    for (let i=0; i < simple.length - 1; i++) {
+      const a = simple[i], b = simple[i+1];
+      if ((a.length >= 3 && a.length <= 24) && (b.length >= 3 && b.length <= 24)) {
+        if (tokenMayMatch(a + b)) return true;
+      }
+    }
+    return false;
+  }
+
+  function makeVariants(videoEl) {
+    const w0 = videoEl.videoWidth || 1280, h0 = videoEl.videoHeight || 720;
+    const scale = Math.min(1, 1800 / w0);
+    const w = Math.max(1, Math.round(w0 * scale)), h = Math.max(1, Math.round(h0 * scale));
+    const base = document.createElement("canvas");
+    base.width = w; base.height = h;
+    base.getContext("2d", {willReadFrequently:true}).drawImage(videoEl, 0, 0, w, h);
+
+    const original = document.createElement("canvas");
+    original.width = w; original.height = h;
+    original.getContext("2d").drawImage(base, 0, 0);
+
+    const contrast = document.createElement("canvas");
+    contrast.width = w; contrast.height = h;
+    const cctx = contrast.getContext("2d", {willReadFrequently:true});
+    cctx.drawImage(base, 0, 0);
+    let img = cctx.getImageData(0, 0, w, h);
+    for (let i=0; i<img.data.length; i+=4) {
+      for (let c=0; c<3; c++) img.data[i+c] = Math.max(0, Math.min(255, (img.data[i+c]-128)*1.65+128));
+    }
+    cctx.putImageData(img, 0, 0);
+
+    const bw = document.createElement("canvas");
+    bw.width = w; bw.height = h;
+    const bwctx = bw.getContext("2d", {willReadFrequently:true});
+    bwctx.drawImage(base, 0, 0);
+    img = bwctx.getImageData(0, 0, w, h);
+    for (let i=0; i<img.data.length; i+=4) {
+      const gray = .299*img.data[i] + .587*img.data[i+1] + .114*img.data[i+2];
+      const v = gray > 150 ? 255 : 0;
+      img.data[i] = img.data[i+1] = img.data[i+2] = v;
+    }
+    bwctx.putImageData(img, 0, 0);
+
+    // Vergrößerter mittlerer Bildausschnitt: hilft, wenn das Wort klein im Bild ist.
+    const crop = document.createElement("canvas");
+    const cw = Math.round(w*.72), ch = Math.round(h*.58);
+    crop.width = Math.min(2200, cw*2); crop.height = Math.min(1600, ch*2);
+    const cx = crop.getContext("2d", {willReadFrequently:true});
+    cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = "high";
+    cx.drawImage(base, Math.round((w-cw)/2), Math.round((h-ch)/2), cw, ch, 0, 0, crop.width, crop.height);
+
+    const cropContrast = document.createElement("canvas");
+    cropContrast.width = crop.width; cropContrast.height = crop.height;
+    const cc = cropContrast.getContext("2d", {willReadFrequently:true});
+    cc.drawImage(crop, 0, 0);
+    img = cc.getImageData(0, 0, crop.width, crop.height);
+    for (let i=0; i<img.data.length; i+=4) {
+      for (let c=0; c<3; c++) img.data[i+c] = Math.max(0, Math.min(255, (img.data[i+c]-128)*1.55+128));
+    }
+    cc.putImageData(img, 0, 0);
+    return [
+      {canvas:original, mode:"6", label:"Ganzes Bild"},
+      {canvas:contrast, mode:"11", label:"Kontrast"},
+      {canvas:bw, mode:"11", label:"Schwarz-Weiß"},
+      {canvas:crop, mode:"11", label:"Vergrößerter Ausschnitt"},
+      {canvas:cropContrast, mode:"8", label:"Einzelwort-Ausschnitt"}
+    ];
+  }
+
+  async function ensureWorker() {
+    if (worker) return worker;
+    if (!window.Tesseract) throw new Error("OCR-Bibliothek konnte nicht geladen werden. Prüfe die Internetverbindung.");
+    setInfo("Deutsche Texterkennung wird geladen. Das kann beim ersten Start etwas dauern …");
+    worker = await Tesseract.createWorker("deu", 1, {
+      logger: m => {
+        if (m.status && m.status !== "recognizing text") {
+          setInfo("OCR wird vorbereitet: " + m.status + (m.progress ? " " + Math.round(m.progress*100) + "%" : ""));
+        }
+      }
+    });
+    await worker.setParameters({
+      preserve_interword_spaces: "1",
+      user_defined_dpi: "300"
+    });
+    engineBadge.textContent = "Deutsch-OCR bereit";
+    return worker;
+  }
+
+  async function recognizeCanvas(canvas, mode) {
+    // 6 = Textblock, 11 = verstreuter Text, 8 = einzelnes Wort.
+    await worker.setParameters({ tessedit_pageseg_mode: String(mode || "6") });
+    const result = await worker.recognize(canvas);
+    return {
+      text: result && result.data ? (result.data.text || "") : "",
+      confidence: result && result.data ? (result.data.confidence || 0) : 0
+    };
+  }
+
+  async function scan() {
+    if (!running || scanning || !video.videoWidth || video.readyState < 2) return;
+    scanning = true;
+    // Während ein vollständiger Scan läuft, darf kein alter/neuer Status sichtbar sein.
+    setStatus("empty", "");
+    try {
+      await ensureWorker();
+      const variants = makeVariants(video);
+      const outputs = [];
+      let targetFound = false;
+      for (let i = 0; i < variants.length; i++) {
+        if (!running) break;
+        const variant = variants[i];
+        const result = await recognizeCanvas(variant.canvas, variant.mode);
+        outputs.push({...result, label:variant.label});
+        // Treffer nur merken; erst nach Abschluss aller OCR-Varianten entscheiden.
+        if (containsTarget(result.text)) targetFound = true;
+      }
+
+      const allText = outputs.map(r => r.text.trim()).filter(Boolean);
+      const combined = outputs.map((r) => r.label + " (Konfidenz " + Math.round(r.confidence) + "%):\n" + (r.text || "[kein Text]")).join("\n\n");
+      recognizedEl.textContent = combined || "Kein Text erkannt.";
+      if (!running) {
+        setStatus("empty", "");
+      } else if (targetFound) {
+        setStatus("blocked", "✕ BLOCKIERT");
+        setInfo("Vollständiger Scan abgeschlossen: Treffer gefunden.");
+      } else if (allText.length) {
+        setStatus("posted", "✓ GEPOSTET");
+        setInfo("Vollständiger Scan abgeschlossen: Text erkannt, kein passender Treffer gefunden.");
+      } else {
+        setStatus("empty", "");
+        setInfo("Kein lesbarer Text erkannt. Richte die Kamera neu aus und tippe auf Start für einen weiteren Scan.");
+        if (running) {
+          startBtn.disabled = false;
+          startBtn.textContent = "Nächsten Text scannen";
+        }
+      }
+    } catch (err) {
+      setInfo("Fehler: " + (err && err.message ? err.message : String(err)));
+      engineBadge.textContent = "OCR-Fehler";
+      if (running) {
+        startBtn.disabled = false;
+        startBtn.textContent = "Erneut versuchen";
+      }
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function startCamera() {
+    // Wenn die Kamera bereits läuft, löst der Button nur einen einzelnen neuen Scan aus.
+    if (running && stream) {
+      if (!scanning && !statusTimeout) {
+        startBtn.disabled = true;
+        startBtn.textContent = "Text wird gelesen …";
+        setStatus("empty", "");
+        setInfo("Text wird vollständig ausgelesen. Bitte warten …");
+        scan();
+      }
+      return;
+    }
+    if (!window.isSecureContext) {
+      setInfo("Kamerazugriff benötigt HTTPS. Öffne die Seite über deine GitHub-Pages-Adresse (https://…).");
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setInfo("Dieser Browser unterstützt den Kamerazugriff nicht. Bitte in Safari öffnen.");
+      return;
+    }
+    try {
+      startBtn.disabled = true;
+      setInfo("Kamera wird gestartet …");
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      });
+      video.srcObject = stream;
+      await video.play();
+      running = true;
+      stopBtn.disabled = false;
+      await ensureWorker();
+      setInfo("Kamera aktiv. Richte sie auf den Text und tippe auf „Start“, um einen Scan durchzuführen.");
+      startBtn.textContent = "Start – Text scannen";
+      // Genau ein Scan beim Start; weitere Scans erfolgen nur nach erneutem Tastendruck.
+      startBtn.disabled = true;
+      scan();
+    } catch (err) {
+      stopCamera();
+      setInfo("Kamera/OCR konnte nicht gestartet werden: " + (err && err.message ? err.message : String(err)) + ". Prüfe die Kameraberechtigung und die Internetverbindung.");
+    } finally {
+      startBtn.disabled = false;
+    }
+  }
+
+  function stopCamera() {
+    running = false;
+    if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
+    if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
+    video.srcObject = null;
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+    startBtn.textContent = "Kamera starten";
+    if (statusTimeout) { clearTimeout(statusTimeout); statusTimeout = null; }
+    setStatus("empty", "");
+    setInfo("Kamera gestoppt.");
+  }
+
+  startBtn.addEventListener("click", startCamera);
+  stopBtn.addEventListener("click", stopCamera);
+  window.addEventListener("pagehide", stopCamera);
+})();
+</script>
+</body>
+</html>
